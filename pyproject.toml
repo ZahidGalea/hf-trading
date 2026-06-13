@@ -1,0 +1,20 @@
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry]
+name = "hft-crypto-mvp"
+version = "0.1.0"
+description = "ASMicroPriceMaker en NautilusTrader — BTC/USDT-M Futures"
+
+[tool.poetry.dependencies]
+python = "^3.13"
+nautilus_trader = ">=1.200.0"
+pandas = ">=2.2"
+numpy = ">=1.26"
+
+[tool.poetry.group.dev.dependencies]
+pytest = ">=8.0"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
