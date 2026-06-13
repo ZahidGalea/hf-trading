@@ -31,7 +31,7 @@ class ASMicroPriceMaker(Strategy):
 
     def __init__(self, config: ASMicroPriceMakerConfig) -> None:
         super().__init__(config)
-        self.config = config
+        # self.config es provisto por la clase base de NautilusTrader
         self._instrument_id = InstrumentId.from_str(config.instrument_id)
         self._ewma_vol = EWMAVolatility(span=config.sigma_span)
         # (timestamp_ns, mid) para el circuit breaker de 1s
