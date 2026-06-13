@@ -110,11 +110,11 @@ class ASMicroPriceMaker(Strategy):
         asks_raw = list(book.asks())
         # BookLevel tiene .price y .size
         bids_levels = [
-            (float(level.price), float(level.size))
+            (float(level.price), level.size())
             for level in bids_raw[: self.config.obi_depth_levels]
         ]
         asks_levels = [
-            (float(level.price), float(level.size))
+            (float(level.price), level.size())
             for level in asks_raw[: self.config.obi_depth_levels]
         ]
         obi = compute_obi(bids_levels, asks_levels, self.config.obi_depth_levels)
@@ -149,9 +149,10 @@ class ASMicroPriceMaker(Strategy):
         quote_ask = self._round_up(ref_price + ask_dist, tick)
 
         # 9) VIABILIDAD ECONÓMICA §3: spread cotizado ≥ 2·f_maker·micro_price
+        # Se agrega medio tick de margen extra para absorber errores de punto flotante en floor/ceil.
         min_spread = 2.0 * self.config.f_maker * micro_price
         if (quote_ask - quote_bid) < min_spread:
-            half_min = min_spread / 2.0
+            half_min = min_spread / 2.0 + tick * 0.5
             quote_bid = self._round_down(ref_price - half_min, tick)
             quote_ask = self._round_up(ref_price + half_min, tick)
 
