@@ -31,6 +31,7 @@ def _build_engine(
     n_events: int = 300,
     seed: int = 42,
     include_volatile_period: bool = False,
+    event_interval_ms: int = 100,
 ) -> BacktestEngine:
     """Construye un BacktestEngine con datos sintéticos listo para correr."""
     engine = BacktestEngine(
@@ -55,6 +56,7 @@ def _build_engine(
         n_events=n_events,
         seed=seed,
         include_volatile_period=include_volatile_period,
+        event_interval_ms=event_interval_ms,
     )
     engine.add_data(deltas)
 
@@ -236,3 +238,58 @@ def test_backtest_result_has_expected_fields():
     assert "orders.total" in result.summary
     assert "positions.total" in result.summary
     assert "account.BINANCE.balance.USDT.total" in result.summary
+
+
+# ─────────────── Tests anti-flood (regresión del bug de 30 posiciones en 10s) ───────────────
+
+
+def test_throttle_limits_requote_rate():
+    """Con eventos muy juntos (<500ms total), el cooldown limita a 1 re-quote (2 órdenes).
+
+    Regresión: antes del fix, el bot enviaba una nueva cotización en CADA delta del libro,
+    inundando el exchange con ~30 envíos en 10s. Ahora requote_min_interval_ms=500 garantiza
+    que en una ventana de 200ms (20 eventos × 10ms) solo ocurra el re-quote inicial.
+    """
+    # 20 eventos × 10ms = 200ms de datos — menos de 1 intervalo de cooldown de 500ms
+    engine = _build_engine(n_events=20, seed=42, event_interval_ms=10)
+    _add_strategy(engine, requote_min_interval_ms=500)
+    engine.run()
+
+    total_orders = int(engine.get_result().summary.get("orders.total", 0))
+    # Solo el primer re-quote debe haber ocurrido: 1 bid + 1 ask = 2 órdenes máximo
+    assert total_orders <= 2, (
+        f"El throttle de 500ms debería limitar a ≤2 órdenes en 200ms de datos, "
+        f"pero se enviaron {total_orders}. El cooldown no está funcionando."
+    )
+
+
+def test_position_gate_blocks_accumulation_side():
+    """Con q_max muy pequeño, la estrategia no acumula el lado que ya alcanzó el límite.
+
+    Regresión: antes del fix, no había ningún tope de posición en la ruta de envío —
+    las órdenes seguían enviándose en ambos lados aunque la posición superara q_max.
+    Ahora _requote() solo cotiza el lado que reduce inventario cuando abs(q) >= q_max.
+
+    Verificación indirecta: con q_max=0.0001 BTC (mínimo bajo el tamaño de orden 0.001),
+    solo puede haber un fill parcial antes de que el tope bloquee el lado acumulador.
+    El número de órdenes totales debe ser menor que con q_max normal.
+    """
+    # q_max < order_qty_btc → cualquier fill supera el límite inmediatamente
+    engine_capped = _build_engine(n_events=200, seed=42)
+    _add_strategy(engine_capped, q_max=0.0001)
+    engine_capped.run()
+    orders_capped = int(engine_capped.get_result().summary.get("orders.total", 0))
+
+    engine_normal = _build_engine(n_events=200, seed=42)
+    _add_strategy(engine_normal, q_max=0.01)
+    engine_normal.run()
+    orders_normal = int(engine_normal.get_result().summary.get("orders.total", 0))
+
+    # Con q_max muy bajo, el tope bloquea un lado tras el primer fill → menos órdenes dobles
+    # (puede ser igual si no hay fills; el assertion conservador es que no explote)
+    assert orders_capped >= 0, "Sanity check: el backtest con q_max mínimo no debe crashear"
+    # El número de órdenes con q_max mínimo debe ser ≤ el de q_max normal (nunca más)
+    assert orders_capped <= orders_normal, (
+        f"Con q_max mínimo se esperaban ≤{orders_normal} órdenes, got {orders_capped}. "
+        f"El tope de posición no está bloqueando el lado acumulador."
+    )

@@ -10,3 +10,4 @@ data/
 .pytest_cache/
 secret
 config/overrides.json
+logs

@@ -10,6 +10,7 @@ from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.trading.strategy import Strategy
 
 from config.btc_maker import ASMicroPriceMakerConfig
+from live.order_logger import OrderLogger
 from signals.microstructure import EWMAVolatility, compute_micro_price, compute_obi
 
 
@@ -38,8 +39,8 @@ class ASMicroPriceMaker(Strategy):
         self._mid_hist: deque[tuple[int, float]] = deque(maxlen=500)
         self._active_bid_price: float | None = None
         self._active_ask_price: float | None = None
-        self._active_bid_id = None
-        self._active_ask_id = None
+        self._last_requote_ns: int = 0  # throttle: timestamp del último re-quote
+        self._logger: OrderLogger | None = None
 
     def on_start(self) -> None:
         self._instrument = self.cache.instrument(self._instrument_id)
@@ -48,6 +49,12 @@ class ASMicroPriceMaker(Strategy):
             return
         self.subscribe_order_book_deltas(self._instrument_id)
         self.subscribe_trade_ticks(self._instrument_id)
+
+        self._logger = OrderLogger(db_path=self.config.log_db_path)
+        self._logger.start()
+        self.log.info(
+            f"Order logger iniciado → {self._logger.db_path}", color=LogColor.GREEN
+        )
         self.log.info("ASMicroPriceMaker iniciado.", color=LogColor.GREEN)
 
     def on_order_book_deltas(self, deltas: OrderBookDeltas) -> None:
@@ -156,24 +163,94 @@ class ASMicroPriceMaker(Strategy):
             quote_bid = self._round_down(ref_price - half_min, tick)
             quote_ask = self._round_up(ref_price + half_min, tick)
 
-        # 10) RE-QUOTE SOLO SI DRIFT > 0.5 tick (minimizar mensajes — Byrd §2.5)
+        # 10) RE-QUOTE SOLO SI DRIFT > threshold Y cooldown mínimo cumplido (Byrd §2.5)
         threshold = self.config.requote_threshold_ticks * tick
         bid_drift = abs(quote_bid - self._active_bid_price) if self._active_bid_price is not None else float("inf")
         ask_drift = abs(quote_ask - self._active_ask_price) if self._active_ask_price is not None else float("inf")
 
-        if bid_drift > threshold or ask_drift > threshold:
-            self._requote(quote_bid, quote_ask)
+        min_interval_ns = self.config.requote_min_interval_ms * 1_000_000
+        time_ok = (now_ns - self._last_requote_ns) >= min_interval_ns
+
+        if (bid_drift > threshold or ask_drift > threshold) and time_ok:
+            self._requote(quote_bid, quote_ask, q, now_ns)
 
         self.log.debug(
             f"micro={micro_price:.2f} obi={obi:.3f} sigma={sigma:.6f} q={q:.4f} "
             f"ref={ref_price:.2f} bid={quote_bid:.2f} ask={quote_ask:.2f}"
         )
 
+    # ── Callbacks de estado de órdenes ────────────────────────────────────
+
+    def on_order_submitted(self, event) -> None:
+        if self._logger:
+            self._logger.log_event(
+                "submitted",
+                client_order_id=str(event.client_order_id),
+                instrument_id=str(self._instrument_id),
+            )
+
+    def on_order_accepted(self, event) -> None:
+        if self._logger:
+            self._logger.log_event(
+                "accepted",
+                client_order_id=str(event.client_order_id),
+                venue_order_id=str(getattr(event, "venue_order_id", None) or ""),
+                instrument_id=str(self._instrument_id),
+            )
+
+    def on_order_rejected(self, event) -> None:
+        reason = str(getattr(event, "reason", "unknown"))
+        self.log.warning(f"Orden rechazada: {event.client_order_id} — {reason}", color=LogColor.RED)
+        if self._logger:
+            self._logger.log_event(
+                "rejected",
+                client_order_id=str(event.client_order_id),
+                instrument_id=str(self._instrument_id),
+                reject_reason=reason,
+            )
+
+    def on_order_canceled(self, event) -> None:
+        if self._logger:
+            self._logger.log_event(
+                "canceled",
+                client_order_id=str(event.client_order_id),
+                venue_order_id=str(getattr(event, "venue_order_id", None) or ""),
+                instrument_id=str(self._instrument_id),
+            )
+
+    def on_order_cancel_rejected(self, event) -> None:
+        reason = str(getattr(event, "reason", "unknown"))
+        self.log.warning(
+            f"Cancel rechazado: {event.client_order_id} — {reason}", color=LogColor.RED
+        )
+        if self._logger:
+            self._logger.log_event(
+                "cancel_rejected",
+                client_order_id=str(event.client_order_id),
+                instrument_id=str(self._instrument_id),
+                reject_reason=reason,
+            )
+
     def on_order_filled(self, event) -> None:
         q = self._get_inventory()
+        fill_qty = float(event.last_qty)
+        fill_price = float(event.last_px)
+        side = "BUY" if event.is_buy else "SELL"
         self.log.info(
-            f"Fill recibido — inventario actual: {q:.4f} BTC", color=LogColor.CYAN
+            f"Fill recibido — {side} {fill_qty:.4f} @ {fill_price:.2f} | inventario: {q:.4f} BTC",
+            color=LogColor.CYAN,
         )
+        if self._logger:
+            self._logger.log_event(
+                "filled",
+                client_order_id=str(event.client_order_id),
+                venue_order_id=str(getattr(event, "venue_order_id", None) or ""),
+                instrument_id=str(self._instrument_id),
+                order_side=side,
+                fill_qty=fill_qty,
+                fill_price=fill_price,
+                inventory_qty=q,
+            )
         if abs(q) > self.config.q_max:
             self._reduce_inventory_with_limit(q)
 
@@ -181,6 +258,8 @@ class ASMicroPriceMaker(Strategy):
         self.cancel_all_orders(self._instrument_id)
         self._active_bid_price = None
         self._active_ask_price = None
+        if self._logger:
+            self._logger.stop()
         self.log.info("ASMicroPriceMaker detenido — órdenes canceladas.", color=LogColor.YELLOW)
 
     # --- Métodos internos ---
@@ -189,43 +268,74 @@ class ASMicroPriceMaker(Strategy):
         pos = self.portfolio.net_position(self._instrument_id)
         return float(pos) if pos is not None else 0.0
 
-    def _requote(self, quote_bid: float, quote_ask: float) -> None:
+    def _requote(self, quote_bid: float, quote_ask: float, q: float, now_ns: int) -> None:
+        # Guard: no apilamos nuevas órdenes si aún hay envíos sin confirmar por el exchange
+        if self.cache.orders_inflight(instrument_id=self._instrument_id):
+            return
+
         self.cancel_all_orders(self._instrument_id)
-        self._active_bid_price = None
-        self._active_ask_price = None
 
         qty = self._instrument.make_qty(self.config.order_qty_btc)
+        q_max = self.config.q_max
 
-        bid_order = self.order_factory.limit(
-            instrument_id=self._instrument_id,
-            order_side=OrderSide.BUY,
-            quantity=qty,
-            price=self._instrument.make_price(quote_bid),
-            time_in_force=TimeInForce.GTC,
-            post_only=True,
-        )
-        ask_order = self.order_factory.limit(
-            instrument_id=self._instrument_id,
-            order_side=OrderSide.SELL,
-            quantity=qty,
-            price=self._instrument.make_price(quote_ask),
-            time_in_force=TimeInForce.GTC,
-            post_only=True,
-        )
+        # Tope de posición en la ruta de envío (§5 — Cartea cap):
+        # si abs(q) >= q_max, cotizar solo el lado que reduce inventario.
+        # Previene acumulación runaway aunque fallen las cancelaciones.
+        submit_bid = q < q_max    # no agregar más long si ya en el límite
+        submit_ask = q > -q_max   # no agregar más short si ya en el límite
 
-        self.submit_order(bid_order)
-        self.submit_order(ask_order)
-        self._active_bid_price = quote_bid
-        self._active_ask_price = quote_ask
+        if submit_bid:
+            bid_order = self.order_factory.limit(
+                instrument_id=self._instrument_id,
+                order_side=OrderSide.BUY,
+                quantity=qty,
+                price=self._instrument.make_price(quote_bid),
+                time_in_force=TimeInForce.GTC,
+                post_only=True,
+            )
+            self.submit_order(bid_order)
+            self._active_bid_price = quote_bid
+
+        if submit_ask:
+            ask_order = self.order_factory.limit(
+                instrument_id=self._instrument_id,
+                order_side=OrderSide.SELL,
+                quantity=qty,
+                price=self._instrument.make_price(quote_ask),
+                time_in_force=TimeInForce.GTC,
+                post_only=True,
+            )
+            self.submit_order(ask_order)
+            self._active_ask_price = quote_ask
+
+        self._last_requote_ns = now_ns
+
+        sides = ("BID " if submit_bid else "") + ("ASK" if submit_ask else "")
+        self.log.info(
+            f"Re-quote [{sides.strip()}] bid={quote_bid:.2f} ask={quote_ask:.2f} q={q:.4f}",
+            color=LogColor.CYAN,
+        )
+        if self._logger:
+            self._logger.log_event(
+                "requote",
+                quote_bid=quote_bid,
+                quote_ask=quote_ask,
+                inventory_qty=q,
+                submit_bid=int(submit_bid),
+                submit_ask=int(submit_ask),
+            )
 
     def _reduce_inventory_with_limit(self, q: float) -> None:
-        """Reduce inventario excedente con limit agresivo (no market, evita fee taker)."""
+        """Reduce inventario excedente con limit agresivo (no market, evita fee taker).
+
+        Siempre envía order_qty_btc completo (no solo el exceso), porque el mínimo
+        nocional de Binance (~50 USD) rechaza órdenes de exceso fraccional pequeño.
+        """
         book = self.cache.order_book(self._instrument_id)
         if book is None:
             return
         mid_p = (float(book.best_bid_price()) + float(book.best_ask_price())) / 2.0
         tick = float(self._instrument.price_increment)
-        excess = abs(q) - self.config.q_max
 
         if q > 0:
             price = self._instrument.make_price(mid_p - tick)
@@ -237,7 +347,7 @@ class ASMicroPriceMaker(Strategy):
         reduce_order = self.order_factory.limit(
             instrument_id=self._instrument_id,
             order_side=side,
-            quantity=self._instrument.make_qty(min(excess, self.config.order_qty_btc)),
+            quantity=self._instrument.make_qty(self.config.order_qty_btc),
             price=price,
             time_in_force=TimeInForce.GTC,
             post_only=True,
