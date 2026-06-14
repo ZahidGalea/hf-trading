@@ -35,17 +35,42 @@ export BINANCE_TESTNET_API_SECRET=...
 
 Testnet credentials go in `.env` (copy from `.env.example`). Get keys at https://testnet.binancefuture.com.
 
+# AgentOps — auto-optimización autónoma
+
+```bash
+# Loop completo (lanza bot + analiza cada 5 min + ajusta parámetros)
+poetry run python -m agentops.runner
+
+# Opciones útiles
+poetry run python -m agentops.runner --dry-run         # analizar sin aplicar cambios
+poetry run python -m agentops.runner --analyze-only    # snapshot único del DB más reciente
+poetry run python -m agentops.runner --history         # ver historial de ciclos
+poetry run python -m agentops.runner --interval 120    # ciclos de 2 min en vez de 5
+poetry run python -m agentops.runner --max-cycles 10   # parar tras N ciclos
+```
+
 ## Architecture
 
 ```
 config/btc_maker.py         ASMicroPriceMakerConfig — all strategy parameters with defaults
+config/overrides.json       Active parameter overrides written by AgentOps (gitignored)
 signals/microstructure.py   Pure-Python signal primitives (no NautilusTrader imports)
 strategy/as_maker.py        ASMicroPriceMaker(Strategy) — 10-step quoting algorithm
 backtest/run_backtest.py    BacktestEngine runner for L2 historical Parquet data
 live/run_testnet.py         TradingNode runner for Binance Futures Testnet
+live/order_logger.py        Async SQLite logger (background thread, WAL mode)
+live/analyze_trading.py     Human-readable trading session report from SQLite
+agentops/analyzer.py        analyze_db(db_path) → metrics dict (reads SQLite, WAL checkpoint)
+agentops/safety.py          check_safety(metrics, q_max) → emergency stop conditions
+agentops/adjuster.py        compute_adjustment(metrics, params) → single param change or None
+agentops/history.py         record_cycle() / read_history() — JSONL experiment log
+agentops/runner.py          Main loop: launch bot → wait → analyze → adjust → restart
+logs/trading_*.db           SQLite DBs generated per bot session
+logs/agentops_history.jsonl One JSON line per AgentOps cycle (params before/after, metrics, reason)
 tests/fixtures/book_data.py Synthetic L2 OrderBookDeltas generator for tests
 tests/signals/              Unit tests for signal primitives
 tests/integration/          End-to-end BacktestEngine tests using synthetic data
+tests/agentops/             Unit tests for all agentops modules (76 tests total)
 ```
 
 ### Signal layer (`signals/microstructure.py`)
@@ -81,6 +106,23 @@ All orders are `post_only=True`. Inventory reduction uses limit orders (not mark
 ### Backtest limitations
 
 The L2 backtest fill model overestimates fills because it doesn't model queue position. Use it for signal-behavior validation, not PnL estimation (§7 of the strategy doc).
+
+### AgentOps loop (`agentops/`)
+
+Autonomous optimization loop that runs alongside the bot. Every cycle:
+
+1. Reads `logs/trading_*.db` (most recent, WAL checkpoint for live-safe reads)
+2. Computes metrics: `net_pnl`, `spread_captured_usd`, `fee_per_roundtrip`, `fill_rate_per_min`, `submit_rate_per_s`, `reject_pct`, `cancel_rejected`, `inventory_max_abs`, `requote_rate_per_s`, `fast_requote_pct`
+3. Checks emergency conditions (SIGTERM if triggered): `cancel_rejected > 5`, `submit_rate > 20/s`, `inventory > q_max×1.5`, `reject_pct > 15%`
+4. Computes ONE parameter adjustment (priority HIGH→MEDIUM→LOW):
+   - **HIGH**: spread < fees×1.1 → increase `gamma` (fallback `tau`); spread > fees×3 + low fills → decrease `gamma`
+   - **MEDIUM**: fills < 0.2/min → decrease `requote_threshold_ticks`; inventory > q_max×0.8 → increase `signal_gain`
+   - **LOW**: fast requotes > 10% → increase `vol_breaker`; adverse fills → decrease `signal_gain`
+5. Writes adjusted params to `config/overrides.json`, restarts bot, records cycle in `logs/agentops_history.jsonl`
+
+Parameter bounds enforced by `agentops/adjuster.py::PARAM_BOUNDS`. `q_max` and `requote_min_interval_ms` (<200ms) are never auto-adjusted. Max 1 param per cycle to attribute causality.
+
+Expected convergence toward positive P&L in 3–6 cycles by widening the A-S spread past the fee round-trip (~$25.78/BTC at VIP0).
 
 ## Key invariants
 
