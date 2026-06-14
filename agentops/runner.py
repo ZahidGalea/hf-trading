@@ -58,21 +58,18 @@ def get_effective_params() -> dict:
 
 
 def _launch_bot() -> subprocess.Popen:
-    """Launch the bot subprocess and poll 5s to detect immediate startup failures."""
+    """Launch the bot subprocess and poll for _STARTUP_TIMEOUT_S to detect immediate startup failures."""
     proc = subprocess.Popen(
         _BOT_CMD,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
         env={**os.environ},
     )
-    check_until = time.monotonic() + 5
+    check_until = time.monotonic() + _STARTUP_TIMEOUT_S
     while time.monotonic() < check_until:
         rc = proc.poll()
         if rc is not None:
-            out = proc.stdout.read() if proc.stdout else ""
             raise RuntimeError(
-                f"Bot exited (code {rc}) within {_STARTUP_TIMEOUT_S}s.\nOutput:\n{out}"
+                f"Bot exited (code {rc}) within {_STARTUP_TIMEOUT_S}s. "
+                "Check bot output above for details."
             )
         time.sleep(0.5)
     print(f"[agentops] Bot launched — PID {proc.pid}")
