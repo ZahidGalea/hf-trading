@@ -106,3 +106,32 @@ def test_apply_bounds_clamps_to_min():
 
 def test_apply_bounds_requote_min_interval_floor():
     assert apply_bounds("requote_min_interval_ms", 100) == 200
+
+
+def test_fast_requotes_increases_vol_breaker():
+    metrics = {
+        **GOOD_METRICS,
+        "fast_requote_pct": 15.0,   # > 10 — triggers LOW stability
+        "spread_captured_usd": 28.0,  # OK spread
+        "fill_rate_per_min": 2.0,     # OK fill rate
+        "inventory_max_abs": 0.003,   # OK inventory
+    }
+    result = compute_adjustment(metrics, BASE_PARAMS)
+    assert result is not None
+    assert result["param"] == "vol_breaker"
+    assert result["new_value"] > BASE_PARAMS["vol_breaker"]
+
+
+def test_adverse_fills_decreases_signal_gain():
+    metrics = {
+        **GOOD_METRICS,
+        "fill_rate_per_min": 6.0,    # > 5
+        "net_pnl": -0.5,             # < 0 (adverse fills)
+        "spread_captured_usd": 28.0, # OK spread
+        "inventory_max_abs": 0.003,  # OK inventory
+        "fast_requote_pct": 2.0,     # OK stability
+    }
+    result = compute_adjustment(metrics, BASE_PARAMS)
+    assert result is not None
+    assert result["param"] == "signal_gain"
+    assert result["new_value"] < BASE_PARAMS["signal_gain"]
