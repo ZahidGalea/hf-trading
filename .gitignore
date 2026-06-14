@@ -8,3 +8,5 @@ data/
 *.parquet
 *.csv
 .pytest_cache/
+secret
+config/overrides.json
