@@ -6,7 +6,9 @@ import sqlite3
 def analyze_db(db_path: str, f_maker: float = 0.0002) -> dict:
     """Read a trading session SQLite DB and return a metrics dict.
 
-    Issues a WAL checkpoint so writes from a live bot are visible before reading.
+    Issues a PASSIVE WAL checkpoint (best-effort) so recently committed
+    writes from a live bot are more likely to be visible. Does not block
+    on active writers.
     """
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
@@ -42,8 +44,8 @@ def _compute_metrics(conn: sqlite3.Connection, f_maker: float) -> dict:
         ORDER BY ts_ns
     """).fetchall()
 
-    buy_rows  = [r for r in fills if (r["order_side"] or "").upper() in ("BUY",  "1")]
-    sell_rows = [r for r in fills if (r["order_side"] or "").upper() in ("SELL", "2")]
+    buy_rows  = [r for r in fills if str(r["order_side"] or "").upper() in ("BUY",  "1")]
+    sell_rows = [r for r in fills if str(r["order_side"] or "").upper() in ("SELL", "2")]
 
     total_buy_qty  = sum(r["fill_qty"] for r in buy_rows)
     total_sell_qty = sum(r["fill_qty"] for r in sell_rows)
@@ -59,7 +61,7 @@ def _compute_metrics(conn: sqlite3.Connection, f_maker: float) -> dict:
     matched       = min(total_buy_qty, total_sell_qty)
     spread_usd    = (vwap_sell - vwap_buy) if (buy_rows and sell_rows) else 0.0
     gross_pnl     = matched * spread_usd
-    avg_price     = (vwap_buy + vwap_sell) / 2 if (vwap_buy and vwap_sell) else max(vwap_buy, vwap_sell)
+    avg_price     = (vwap_buy + vwap_sell) / 2 if (buy_rows and sell_rows) else (vwap_buy or vwap_sell)
     fees          = matched * 2 * f_maker * avg_price
     net_pnl       = gross_pnl - fees
     fee_per_roundtrip = 2 * f_maker * avg_price

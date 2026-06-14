@@ -126,3 +126,18 @@ def test_fill_rate_per_min(tmp_path):
     m = analyze_db(db)
     # 2 fills over 30s = 4/min
     assert abs(m["fill_rate_per_min"] - 4.0) < 0.5
+
+
+def test_only_buy_fills_no_sell(tmp_path):
+    t0 = 10 * ONE_S
+    events = [
+        (t0, "filled", "BUY", 0.001, 60000.0, 0.001),
+    ]
+    db = _make_db(tmp_path, events=events)
+    m = analyze_db(db)
+    # Only buys — spread is 0, no net PnL from roundtrip
+    assert m["spread_captured_usd"] == 0.0
+    assert m["net_pnl"] == 0.0
+    assert m["inventory_max_abs"] == pytest.approx(0.001)
+    # avg_fill_price should be non-zero (derived from vwap_buy)
+    assert m["avg_fill_price"] == pytest.approx(60000.0)
